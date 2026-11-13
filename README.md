@@ -63,3 +63,5 @@ The Mistral GitHub App must be installed on the repository so Mistral Cloud can 
 Start an execution of `repo-digest` (Studio console or API) with the input above. The first
 run as a user without a Slack credential pauses and emits an `auth_url` event — complete the
 OAuth flow and the run resumes.
+
+## Test 1
