@@ -310,62 +310,6 @@ def format_digest(
     return _render_digest(repo_handle, since, merged, awaiting_review)
 
 
-def _tool_list(payload: Any) -> list[dict[str, Any]]:
-    tools = getattr(payload, "tools", None) if not isinstance(payload, dict) else payload.get("tools")
-    if not isinstance(tools, list):
-        return []
-    result: list[dict[str, Any]] = []
-    for tool in tools:
-        if isinstance(tool, dict):
-            result.append(tool)
-        elif hasattr(tool, "model_dump"):
-            result.append(tool.model_dump())
-    return result
-
-
-def _pick_tool(
-    tools: list[dict[str, Any]],
-    *,
-    name_hints: tuple[str, ...],
-    description_hints: tuple[str, ...] = (),
-    exclude: tuple[str, ...] = (),
-) -> dict[str, Any] | None:
-    for tool in tools:
-        name = str(tool.get("name") or "").lower()
-        if all(hint in name for hint in name_hints) and not any(ex in name for ex in exclude):
-            return tool
-    if description_hints:
-        for tool in tools:
-            name = str(tool.get("name") or "").lower()
-            description = str(tool.get("description") or "").lower()
-            if (
-                all(hint in description for hint in description_hints)
-                and not any(ex in name for ex in exclude)
-            ):
-                return tool
-    return None
-
-
-def _schema_properties(tool: dict[str, Any]) -> dict[str, Any]:
-    schema = tool.get("input_schema") or tool.get("inputSchema") or {}
-    if not isinstance(schema, dict):
-        return {}
-    properties = schema.get("properties")
-    return properties if isinstance(properties, dict) else {}
-
-
-def _pick_arg(properties: dict[str, Any], candidates: tuple[str, ...]) -> str | None:
-    lowered = {str(key).lower(): key for key in properties}
-    for candidate in candidates:
-        if candidate in lowered:
-            return lowered[candidate]
-    for key in properties:
-        key_lower = str(key).lower()
-        if any(candidate in key_lower for candidate in candidates):
-            return key
-    return None
-
-
 def _dig_json(payload: Any) -> Any:
     if isinstance(payload, dict):
         for key in ("structuredContent", "structured_content", "result", "data"):
@@ -393,81 +337,41 @@ def _dig_json(payload: Any) -> Any:
 
 async def _post_digest_to_self_dm(
     call_tool: Callable[..., Awaitable[Any]],
-    client_factory: Callable[..., Any],
     digest_markdown: str,
 ) -> SlackPost:
-    client = client_factory(use_executor_credentials=True)
-    tools_payload = await client.beta.connectors.list_tools_async(
-        connector_id_or_name="slack", page_size=100
-    )
-    tools = _tool_list(tools_payload)
-    if not tools:
+    profile = _dig_json(await call_tool("slack_read_user_profile", {}))
+    match = _SLACK_USER_ID_RE.search(json.dumps(profile))
+    if not match:
         raise RuntimeError(
-            "The Slack connector exposes no tools: connect Slack (OAuth) for the "
-            "triggering user in Studio, or complete the auth URL emitted on first run."
+            "Could not determine the triggering user's Slack user ID via slack_read_user_profile"
         )
-
-    send_tool = _pick_tool(
-        tools,
-        name_hints=("send", "message"),
-        description_hints=("send", "message"),
-        exclude=("draft", "schedule"),
-    )
-    if send_tool is None:
-        raise RuntimeError("No send-message tool found on the Slack connector")
-
-    profile_tool = (
-        _pick_tool(tools, name_hints=("whoami",))
-        or _pick_tool(tools, name_hints=("read", "user", "profile"))
-        or _pick_tool(tools, name_hints=("user", "profile"))
-        or _pick_tool(tools, name_hints=("user", "info"))
-    )
-    my_user_id: str | None = None
-    if profile_tool is not None:
-        profile_response = _dig_json(await call_tool(profile_tool.get("name"), {}))
-        match = _SLACK_USER_ID_RE.search(json.dumps(profile_response))
-        if match:
-            my_user_id = match.group(0)
-    if my_user_id is None:
-        raise RuntimeError("Could not determine the triggering user's Slack user ID")
-
-    send_props = _schema_properties(send_tool)
-    channel_arg = _pick_arg(send_props, ("channel_id", "channel", "conversation"))
-    text_arg = _pick_arg(send_props, ("message", "text"))
-    if channel_arg is None or text_arg is None:
-        raise RuntimeError(
-            f"Send-message tool {send_tool.get('name')!r} lacks a channel/message argument: {list(send_props)}"
-        )
+    my_user_id = match.group(0)
 
     # slack_send_message accepts a user_id as channel_id, so the self-DM is the
     # triggering user's own ID; fall back to opening the DM conversation explicitly.
-    channel_id = my_user_id
     try:
         send_response = _dig_json(
-            await call_tool(send_tool.get("name"), {channel_arg: channel_id, text_arg: digest_markdown})
+            await call_tool(
+                "slack_send_message", {"channel_id": my_user_id, "message": digest_markdown}
+            )
         )
+        channel_id = my_user_id
     except Exception:
-        create_tool = _pick_tool(tools, name_hints=("create", "conversation"))
-        if create_tool is None:
-            raise
-        create_props = _schema_properties(create_tool)
-        users_arg = _pick_arg(create_props, ("user_ids", "users", "user"))
-        if users_arg is None:
-            raise
-        schema = create_tool.get("input_schema") or create_tool.get("inputSchema") or {}
-        prop = (schema.get("properties") or {}).get(users_arg) or {}
-        value: Any = [my_user_id] if prop.get("type") == "array" else my_user_id
-        create_response = _dig_json(await call_tool(create_tool.get("name"), {users_arg: value}))
-        channel = create_response.get("channel") if isinstance(create_response, dict) else None
-        channel_id = (
-            (channel or {}).get("id")
-            or (create_response or {}).get("channel_id")
-            or (create_response or {}).get("id")
+        conversation = _dig_json(
+            await call_tool("slack_create_conversation", {"user_ids": [my_user_id]})
         )
+        channel = conversation.get("channel") if isinstance(conversation, dict) else None
+        channel_id = None
+        if isinstance(channel, dict):
+            channel_id = channel.get("id")
+        if not channel_id and isinstance(conversation, dict):
+            channel_id = conversation.get("channel_id") or conversation.get("id")
         if not channel_id:
             raise
         send_response = _dig_json(
-            await call_tool(send_tool.get("name"), {channel_arg: channel_id, text_arg: digest_markdown})
+            await call_tool(
+                "slack_send_message", {"channel_id": channel_id, "message": digest_markdown}
+            )
         )
 
     ts = None
@@ -526,7 +430,7 @@ async def post_digest_to_slack_self_dm(
     digest_markdown: str,
     slack: ToolCallClient = Depends(slack_connector),
 ) -> SlackPost:
-    return await _post_digest_to_self_dm(slack.call_tool, get_mistral_client, digest_markdown)
+    return await _post_digest_to_self_dm(slack.call_tool, digest_markdown)
 
 
 @workflows.workflow.define(
