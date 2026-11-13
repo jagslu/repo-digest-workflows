@@ -93,19 +93,6 @@ def test_format_digest_handles_empty_sections():
     assert digest.count("_None_") == 2
 
 
-def test_pick_tool_and_arg():
-    tools = [
-        {"name": "slack_send_message", "description": "Send a message to a conversation", "input_schema": {"properties": {"channel": {}, "text": {}}}},
-        {"name": "slack_list_user_channels", "description": "List channels the user is in", "input_schema": {"properties": {"types": {}, "limit": {}}}},
-    ]
-    send = rd._pick_tool(tools, name_hints=("send", "message"))
-    assert send["name"] == "slack_send_message"
-    assert rd._pick_arg(rd._schema_properties(send), ("channel", "channel_id")) == "channel"
-    assert rd._pick_arg(rd._schema_properties(send), ("text", "message")) == "text"
-    listing = rd._pick_tool(tools, name_hints=("list", "channel"))
-    assert listing["name"] == "slack_list_user_channels"
-
-
 def test_digest_items_fall_back_to_title_when_summary_missing():
     items = rd._digest_items([rd.normalize_pr(OPEN_RAW)], {})
     assert items[0].summary == OPEN_RAW["title"]
@@ -132,33 +119,6 @@ async def test_search_pull_requests_paginates_and_stops(temporal_env_with_conver
 
 
 async def test_post_digest_to_self_dm_flow(temporal_env_with_converter):
-    tools = [
-        {"name": "slack_read_user_profile", "description": "Read a user profile, defaults to current user", "input_schema": {"properties": {"user_id": {"type": "string"}}}},
-        {"name": "slack_send_message_draft", "description": "Create a draft message", "input_schema": {"properties": {"channel_id": {"type": "string"}, "message": {"type": "string"}}}},
-        {"name": "slack_send_message", "description": "Send a message to a channel or user_id", "input_schema": {"properties": {"channel_id": {"type": "string"}, "message": {"type": "string"}}}},
-        {"name": "slack_create_conversation", "description": "Create a channel or DM", "input_schema": {"properties": {"user_ids": {"type": "array", "items": {"type": "string"}}}}},
-    ]
-
-    async def fake_list_tools(**kwargs):
-        class Payload:
-            pass
-
-        payload = Payload()
-        payload.tools = tools
-        return payload
-
-    class FakeBetaConnectors:
-        list_tools_async = staticmethod(fake_list_tools)
-
-    class FakeBeta:
-        connectors = FakeBetaConnectors()
-
-    class FakeClient:
-        beta = FakeBeta()
-
-    def fake_client_factory(**kwargs):
-        return FakeClient()
-
     sent = []
 
     async def fake_call_tool(name, arguments):
@@ -169,32 +129,13 @@ async def test_post_digest_to_self_dm_flow(temporal_env_with_converter):
             return {"ok": True, "ts": "1700000000.000100", "channel": arguments["channel_id"]}
         raise AssertionError(f"unexpected tool {name}")
 
-    post = await rd._post_digest_to_self_dm(fake_call_tool, fake_client_factory, "*digest*")
+    post = await rd._post_digest_to_self_dm(fake_call_tool, "*digest*")
     assert post.channel == "UDV4TPUAE"
     assert post.ts == "1700000000.000100"
     assert sent == [("slack_send_message", {"channel_id": "UDV4TPUAE", "message": "*digest*"})]
 
 
 async def test_post_digest_falls_back_to_create_conversation(temporal_env_with_converter):
-    tools = [
-        {"name": "slack_read_user_profile", "description": "Read a user profile", "input_schema": {"properties": {}}},
-        {"name": "slack_send_message", "description": "Send a message", "input_schema": {"properties": {"channel_id": {"type": "string"}, "message": {"type": "string"}}}},
-        {"name": "slack_create_conversation", "description": "Create a DM", "input_schema": {"properties": {"user_ids": {"type": "array", "items": {"type": "string"}}}}},
-    ]
-
-    async def fake_list_tools(**kwargs):
-        class Payload:
-            pass
-
-        payload = Payload()
-        payload.tools = tools
-        return payload
-
-    class FakeClient:
-        class beta:
-            class connectors:
-                list_tools_async = staticmethod(fake_list_tools)
-
     sent = []
 
     async def fake_call_tool(name, arguments):
@@ -210,7 +151,7 @@ async def test_post_digest_falls_back_to_create_conversation(temporal_env_with_c
             return {"ok": True, "ts": "42.0"}
         raise AssertionError(f"unexpected tool {name}")
 
-    post = await rd._post_digest_to_self_dm(fake_call_tool, lambda **kw: FakeClient(), "hi")
+    post = await rd._post_digest_to_self_dm(fake_call_tool, "hi")
     assert post.channel == "DSELF123"
     assert post.ts == "42.0"
     assert sent[-1] == {"channel_id": "DSELF123", "message": "hi"}
@@ -237,7 +178,7 @@ async def test_repo_digest_workflow_end_to_end(temporal_env_with_converter, monk
     async def fake_summarize(prs, section):
         return {pr.number: f"summary of {pr.number}" for pr in prs}
 
-    async def fake_post(call_tool, client_factory, digest_markdown):
+    async def fake_post(call_tool, digest_markdown):
         assert "#101" in digest_markdown and "#102" in digest_markdown
         return rd.SlackPost(channel="DSELF", ts="1.2")
 
