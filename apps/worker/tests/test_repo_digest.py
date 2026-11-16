@@ -22,7 +22,25 @@ OPEN_RAW = {
     "html_url": "https://github.com/octo/hello/pull/102",
     "user": {"login": "grace"},
     "draft": False,
-    "pull_request": {},
+    "merged_at": None,
+}
+
+STALE_MERGED_RAW = {
+    "number": 100,
+    "title": "Old change merged before the window",
+    "html_url": "https://github.com/octo/hello/pull/100",
+    "user": {"login": "ada"},
+    "draft": False,
+    "merged_at": "2026-01-15T09:00:00Z",
+}
+
+DRAFT_RAW = {
+    "number": 103,
+    "title": "Work in progress draft",
+    "html_url": "https://github.com/octo/hello/pull/103",
+    "user": {"login": "grace"},
+    "draft": True,
+    "merged_at": None,
 }
 
 
@@ -45,28 +63,28 @@ def test_validate_since():
         rd.validate_since("01/31/2026")
 
 
-def test_build_search_query():
-    assert (
-        rd.build_search_query("octo/hello", merged=True, since="2026-01-01")
-        == "repo:octo/hello is:pr is:merged merged:>=2026-01-01"
-    )
-    assert (
-        rd.build_search_query("octo/hello", merged=False)
-        == "repo:octo/hello is:pr is:open -is:draft"
-    )
+def test_is_merged_since_filters_on_merged_at_window():
+    since = "2026-02-01"
+    assert rd.is_merged_since(MERGED_RAW, since)
+    assert not rd.is_merged_since(STALE_MERGED_RAW, since)
+    assert not rd.is_merged_since(OPEN_RAW, since)
+    nested = {**OPEN_RAW, "pull_request": {"merged_at": "2026-02-05T12:00:00Z"}}
+    assert rd.is_merged_since(nested, since)
+    assert not rd.is_merged_since({"number": 1}, since)
+    assert not rd.is_merged_since({"merged_at": "not-a-date"}, since)
 
 
-def test_coerce_search_items_handles_items_content_and_plain_list():
-    assert rd._coerce_search_items({"items": [{"number": 1}]}) == [{"number": 1}]
+def test_coerce_items_handles_items_content_and_plain_list():
+    assert rd._coerce_items({"items": [{"number": 1}]}) == [{"number": 1}]
     mcp_style = {
         "content": [
             {"type": "text", "text": json.dumps({"items": [{"number": 2}]})},
         ]
     }
-    assert rd._coerce_search_items(mcp_style) == [{"number": 2}]
-    assert rd._coerce_search_items([{"number": 3}]) == [{"number": 3}]
-    assert rd._coerce_search_items(None) == []
-    assert rd._coerce_search_items({"unexpected": 1}) == []
+    assert rd._coerce_items(mcp_style) == [{"number": 2}]
+    assert rd._coerce_items([{"number": 3}]) == [{"number": 3}]
+    assert rd._coerce_items(None) == []
+    assert rd._coerce_items({"unexpected": 1}) == []
 
 
 def test_normalize_pr_truncates_body_and_reads_author():
@@ -100,21 +118,23 @@ def test_digest_items_fall_back_to_title_when_summary_missing():
     assert items[0].summary == "one-liner"
 
 
-async def test_search_pull_requests_paginates_and_stops(temporal_env_with_converter, monkeypatch):
+async def test_list_pull_requests_paginates_and_stops(temporal_env_with_converter, monkeypatch):
     calls = []
 
     async def fake_call_tool(name, arguments):
         calls.append((name, dict(arguments)))
         if arguments["page"] == 1:
-            return {"items": [{"number": i} for i in range(rd.PER_PAGE)]}
-        return {"items": [{"number": 999}]}
+            return [{"number": i} for i in range(rd.PER_PAGE)]
+        return [{"number": 999}]
 
-    items = await rd._search_pull_requests(
-        fake_call_tool, query="repo:o/r is:pr", owner="o", repo="r", sort="updated", order="desc"
+    items = await rd._list_pull_requests(
+        fake_call_tool, owner="o", repo="r", state="closed", sort="updated", direction="desc"
     )
     assert len(items) == rd.PER_PAGE + 1
-    assert calls[0][0] == "search_pull_requests"
-    assert calls[0][1]["query"] == "repo:o/r is:pr"
+    assert calls[0][0] == "list_pull_requests"
+    assert calls[0][1]["owner"] == "o" and calls[0][1]["repo"] == "r"
+    assert calls[0][1]["state"] == "closed"
+    assert calls[0][1]["fields"] == rd.GITHUB_PR_FIELDS
     assert calls[1][1]["page"] == 2
 
 
@@ -167,22 +187,24 @@ def test_format_digest_truncates_to_fit_slack_limit():
 
 
 async def test_repo_digest_workflow_end_to_end(temporal_env_with_converter, monkeypatch):
-    async def fake_search(call_tool, *, query, owner, repo, sort, order):
+    async def fake_list(call_tool, *, owner, repo, state, sort, direction):
         assert owner == "octo" and repo == "hello"
-        if "is:merged" in query:
-            assert "merged:>=2026-02-01" in query
-            return [MERGED_RAW]
-        assert "is:open" in query
-        return [OPEN_RAW]
+        if state == "closed":
+            assert sort == "updated" and direction == "desc"
+            return [MERGED_RAW, STALE_MERGED_RAW]
+        assert state == "open"
+        assert sort == "created" and direction == "asc"
+        return [OPEN_RAW, DRAFT_RAW]
 
     async def fake_summarize(prs, section):
         return {pr.number: f"summary of {pr.number}" for pr in prs}
 
     async def fake_post(call_tool, digest_markdown):
         assert "#101" in digest_markdown and "#102" in digest_markdown
+        assert "#100" not in digest_markdown and "#103" not in digest_markdown
         return rd.SlackPost(channel="DSELF", ts="1.2")
 
-    monkeypatch.setattr(rd, "_search_pull_requests", fake_search)
+    monkeypatch.setattr(rd, "_list_pull_requests", fake_list)
     monkeypatch.setattr(rd, "_summarize_prs", fake_summarize)
     monkeypatch.setattr(rd, "_post_digest_to_self_dm", fake_post)
 

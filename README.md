@@ -16,8 +16,9 @@ Workflow `repo-digest` takes two inputs:
 
 It then:
 
-1. Searches GitHub for pull requests `is:merged merged:>=<since>` and for pull requests
-   `is:open -is:draft` (waiting on review) on the repo.
+1. Lists the repo's pull requests through the repo-scoped GitHub pulls API
+   (`list_pull_requests` on the `github_app` connector) and keeps those merged since
+   `<since>`, plus open non-draft PRs (waiting on review).
 2. Writes a one-line summary for each PR with a Mistral model (falls back to the PR title).
 3. Posts the digest to the triggering user's Slack self-DM (the conversation with yourself),
    one bullet per PR with a one-line summary and a link.
