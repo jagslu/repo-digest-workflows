@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 import pydantic
@@ -38,14 +38,15 @@ PER_PAGE = 100
 MAX_PAGES = 3
 BODY_SNIPPET_CHARS = 800
 
-GITHUB_SEARCH_FIELDS = [
+GITHUB_PR_FIELDS = [
     "number",
     "title",
     "body",
     "html_url",
     "user",
     "draft",
-    "pull_request",
+    "state",
+    "merged_at",
     "created_at",
     "updated_at",
 ]
@@ -110,16 +111,34 @@ def validate_since(since: str) -> str:
     return since
 
 
-def build_search_query(repo_handle: str, *, merged: bool, since: str | None = None) -> str:
-    query = f"repo:{repo_handle} is:pr"
-    if merged:
-        query += f" is:merged merged:>={since}"
-    else:
-        query += " is:open -is:draft"
-    return query
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
-def _coerce_search_items(payload: Any) -> list[dict[str, Any]]:
+def _merged_at(raw: dict[str, Any]) -> datetime | None:
+    parsed = _parse_timestamp(raw.get("merged_at"))
+    if parsed is not None:
+        return parsed
+    pr = raw.get("pull_request")
+    if isinstance(pr, dict):
+        return _parse_timestamp(pr.get("merged_at"))
+    return None
+
+
+def is_merged_since(raw: dict[str, Any], since: str) -> bool:
+    merged_at = _merged_at(raw)
+    if merged_at is None:
+        return False
+    cutoff = datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+    return merged_at >= cutoff
+
+
+def _coerce_items(payload: Any) -> list[dict[str, Any]]:
     if payload is None:
         return []
     if isinstance(payload, list):
@@ -131,7 +150,7 @@ def _coerce_search_items(payload: Any) -> list[dict[str, Any]]:
                 return [item for item in value if isinstance(item, dict)]
         structured = payload.get("structuredContent") or payload.get("structured_content")
         if structured is not None:
-            return _coerce_search_items(structured)
+            return _coerce_items(structured)
         content = payload.get("content")
         if isinstance(content, list):
             for block in content:
@@ -141,7 +160,7 @@ def _coerce_search_items(payload: Any) -> list[dict[str, Any]]:
                     and isinstance(block.get("text"), str)
                 ):
                     try:
-                        return _coerce_search_items(json.loads(block["text"]))
+                        return _coerce_items(json.loads(block["text"]))
                     except (ValueError, TypeError):
                         continue
     return []
@@ -150,7 +169,7 @@ def _coerce_search_items(payload: Any) -> list[dict[str, Any]]:
 def normalize_pr(raw: dict[str, Any]) -> PrInfo:
     user = raw.get("user")
     pr = raw.get("pull_request")
-    merged_at = pr.get("merged_at") if isinstance(pr, dict) else None
+    merged_at = raw.get("merged_at") or (pr.get("merged_at") if isinstance(pr, dict) else None)
     return PrInfo(
         number=int(raw.get("number") or 0),
         title=str(raw.get("title") or ""),
@@ -158,35 +177,35 @@ def normalize_pr(raw: dict[str, Any]) -> PrInfo:
         body=str(raw.get("body") or "")[:BODY_SNIPPET_CHARS],
         author=user.get("login") if isinstance(user, dict) else None,
         draft=bool(raw.get("draft")),
-        merged_at=merged_at,
+        merged_at=str(merged_at) if merged_at else None,
     )
 
 
-async def _search_pull_requests(
+async def _list_pull_requests(
     call_tool: Callable[..., Awaitable[Any]],
     *,
-    query: str,
     owner: str,
     repo: str,
+    state: str,
     sort: str,
-    order: str,
+    direction: str,
 ) -> list[dict[str, Any]]:
     collected: list[dict[str, Any]] = []
     for page in range(1, MAX_PAGES + 1):
         response = await call_tool(
-            "search_pull_requests",
+            "list_pull_requests",
             {
-                "query": query,
                 "owner": owner,
                 "repo": repo,
-                "fields": GITHUB_SEARCH_FIELDS,
+                "state": state,
+                "fields": GITHUB_PR_FIELDS,
                 "perPage": PER_PAGE,
                 "page": page,
                 "sort": sort,
-                "order": order,
+                "direction": direction,
             },
         )
-        batch = _coerce_search_items(response)
+        batch = _coerce_items(response)
         collected.extend(batch)
         if len(batch) < PER_PAGE:
             break
@@ -391,15 +410,15 @@ async def fetch_merged_prs(
 ) -> list[PrInfo]:
     owner, repo, handle = parse_repo_handle(repo_handle)
     since = validate_since(since)
-    raw = await _search_pull_requests(
+    raw = await _list_pull_requests(
         github.call_tool,
-        query=build_search_query(handle, merged=True, since=since),
         owner=owner,
         repo=repo,
+        state="closed",
         sort="updated",
-        order="desc",
+        direction="desc",
     )
-    return [normalize_pr(item) for item in raw]
+    return [normalize_pr(item) for item in raw if is_merged_since(item, since)]
 
 
 @workflows.activity(name="fetch-open-prs", start_to_close_timeout=timedelta(minutes=5))
@@ -408,15 +427,15 @@ async def fetch_open_prs(
     github: ToolCallClient = Depends(github_connector),
 ) -> list[PrInfo]:
     owner, repo, handle = parse_repo_handle(repo_handle)
-    raw = await _search_pull_requests(
+    raw = await _list_pull_requests(
         github.call_tool,
-        query=build_search_query(handle, merged=False),
         owner=owner,
         repo=repo,
+        state="open",
         sort="created",
-        order="asc",
+        direction="asc",
     )
-    return [normalize_pr(item) for item in raw]
+    return [normalize_pr(item) for item in raw if not item.get("draft")]
 
 
 @workflows.activity(name="summarize-section", start_to_close_timeout=timedelta(minutes=5))
